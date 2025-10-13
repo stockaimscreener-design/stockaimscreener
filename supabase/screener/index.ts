@@ -1,16 +1,18 @@
 // supabase/functions/screener/index.ts
 // Real-time Finnhub screener - queries based on user filters
 // ENV: FINNHUB_KEY
-
 import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
-import { createClient } from "supabase-js";
-
+// Deno-compatible ESM import for supabase-js
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const FINNHUB_KEY = Deno.env.get("FINNHUB_KEY") ?? "";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+}
 
 if (!FINNHUB_KEY) console.error("[INIT] Missing FINNHUB_KEY");
 
@@ -20,131 +22,147 @@ const RATE_LIMIT_WINDOW = 60000;
 const CONCURRENCY = 3; // Process 3 symbols in parallel
 const MAX_SYMBOLS_TO_CHECK = 100; // Limit to prevent timeout
 
-let apiCallTimestamps: number[] = [];
+let apiCallTimestamps = [];
 
-async function rateLimitedFetch(url: string) {
+async function rateLimitedFetch(url) {
   const now = Date.now();
-  apiCallTimestamps = apiCallTimestamps.filter(ts => now - ts < RATE_LIMIT_WINDOW);
-  
+  apiCallTimestamps = apiCallTimestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW);
+
   if (apiCallTimestamps.length >= CALLS_PER_MINUTE) {
     const oldestCall = apiCallTimestamps[0];
     const waitTime = RATE_LIMIT_WINDOW - (now - oldestCall) + 1000;
-    console.log(`[RATE_LIMIT] Waiting ${Math.ceil(waitTime/1000)}s`);
-    await new Promise(resolve => setTimeout(resolve, waitTime));
-    apiCallTimestamps = apiCallTimestamps.filter(ts => Date.now() - ts < RATE_LIMIT_WINDOW);
+    console.log(`[RATE_LIMIT] Waiting ${Math.ceil(waitTime / 1000)}s`);
+    await new Promise((resolve) => setTimeout(resolve, waitTime));
+    apiCallTimestamps = apiCallTimestamps.filter((ts) => Date.now() - ts < RATE_LIMIT_WINDOW);
   }
-  
+
   apiCallTimestamps.push(Date.now());
   const res = await fetch(url);
-  
+
   if (res.status === 429) {
-    const retryAfter = parseInt(res.headers.get('retry-after') || '60');
+    // Respect Retry-After header if present
+    const retryAfter = parseInt(res.headers.get("retry-after") || "60", 10);
     console.log(`[RATE_LIMIT] Got 429, waiting ${retryAfter}s`);
-    await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+    await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+    // After waiting, call again
     return rateLimitedFetch(url);
   }
-  
+
   return res;
 }
 
-function nowISO() { return new Date().toISOString(); }
+function nowISO() {
+  return new Date().toISOString();
+}
 
-function safeNum(v: any): number | null {
+function safeNum(v) {
   if (v === null || v === undefined) return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
 
-async function finnhubFetch(path: string, params: Record<string, string | number | boolean> = {}) {
+async function finnhubFetch(path, params = {}) {
   const url = new URL(`https://finnhub.io/api/v1/${path}`);
   url.searchParams.set("token", FINNHUB_KEY);
   for (const k of Object.keys(params)) url.searchParams.set(k, String(params[k]));
-  
+
   try {
     const res = await rateLimitedFetch(url.toString());
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`Finnhub ${path} HTTP ${res.status}: ${text}`);
     }
-    return res.json();
+    // Try parse JSON; if it fails, bubble error
+    return await res.json();
   } catch (err) {
-    console.log(JSON.stringify({
-      timestamp: nowISO(),
-      level: "ERROR",
-      source: "FINNHUB_FETCH",
-      path,
-  message: typeof err === "object" && err && "message" in err ? String((err as any).message) : String(err)
-    }));
+    console.log(
+      JSON.stringify({
+        timestamp: nowISO(),
+        level: "ERROR",
+        source: "FINNHUB_FETCH",
+        path,
+        message: typeof err === "object" && err && "message" in err ? String(err.message) : String(err),
+      })
+    );
     throw err;
   }
 }
 
-// Get list of US stocks from Finnhub
-async function fetchUSStockList(): Promise<any[]> {
-  console.log("[FETCH] Getting US stock symbols");
+// Get list of NASDAQ/NYSE stocks from our database
+async function fetchStockTickers(exchange?: 'NASDAQ' | 'NYSE') {
+  console.log(`[FETCH] Getting ${exchange || 'NASDAQ/NYSE'} stock symbols from database`);
   try {
-    const list = await finnhubFetch("stock/symbol", { exchange: "US" });
-    if (!Array.isArray(list)) return [];
+    if (!supabase) {
+      console.log("[ERROR] Supabase client not initialized");
+      return [];
+    }
+
+    let query = supabase.from('stock_tickers').select('*');
     
-    // Filter for common stocks only
-    const filtered = list.filter((s: any) => {
-      const symbol = String(s.symbol);
-      const type = String(s.type || '').toLowerCase();
-      
-      // Keep only common stocks, exclude warrants, units, ETFs
-      return !symbol.includes('.') && 
-             !symbol.includes('-') && 
-             !symbol.includes('^') &&
-             !symbol.match(/[UW]$/) &&
-             type !== 'etp' && // ETFs
-             type !== 'warrant';
-    });
+    if (exchange) {
+      query = query.eq('exchange', exchange);
+    }
     
-    console.log(`[FETCH] Found ${filtered.length} valid US stocks`);
-    return filtered;
+    const { data, error } = await query;
+    
+    if (error) {
+      console.log("[ERROR] fetchStockTickers:", error.message);
+      return [];
+    }
+    
+    if (!Array.isArray(data)) return [];
+    
+    console.log(`[FETCH] Found ${data.length} valid stocks from database`);
+    return data.map(ticker => ({
+      symbol: ticker.Symbol,
+      type: 'common',
+      description: ticker['Company Name']
+    }));
   } catch (err) {
-  console.log("[ERROR] fetchUSStockList:", typeof err === "object" && err && "message" in err ? String((err as any).message) : String(err));
+    console.log(
+      "[ERROR] fetchStockTickers:",
+      typeof err === "object" && err && "message" in err ? String(err.message) : String(err)
+    );
     return [];
   }
 }
 
 // Fetch comprehensive data for a single symbol
-async function fetchSymbolData(symbol: string) {
+async function fetchSymbolData(symbol) {
   try {
     // Parallel fetch: quote, profile, and metrics (3 API calls per symbol)
     const [quoteData, profileData, metricData] = await Promise.all([
       finnhubFetch("quote", { symbol }).catch(() => null),
       finnhubFetch("stock/profile2", { symbol }).catch(() => null),
-      finnhubFetch("stock/metric", { symbol, metric: "all" }).catch(() => null)
+      finnhubFetch("stock/metric", { symbol, metric: "all" }).catch(() => null),
     ]);
 
     // Parse quote data
     const c = safeNum(quoteData?.c);
     const pc = safeNum(quoteData?.pc);
-    const change_percent = (c !== null && pc !== null && pc !== 0) 
-      ? Number((((c - pc) / pc) * 100).toFixed(4)) 
-      : null;
+    const change_percent =
+      c !== null && pc !== null && pc !== 0 ? Number(((c - pc) / pc * 100).toFixed(4)) : null;
     const volume = safeNum(quoteData?.v ?? quoteData?.volume) ?? null;
 
     // Parse profile data (market cap is in millions, convert to actual value)
-    const market_cap = safeNum(profileData?.marketCapitalization) 
-      ? safeNum(profileData.marketCapitalization)! * 1e6 
+    const market_cap = safeNum(profileData?.marketCapitalization)
+      ? safeNum(profileData.marketCapitalization) * 1e6
       : null;
     const shares_float = safeNum(profileData?.shareOutstanding) ?? null;
     const name = profileData?.name ?? null;
 
-    // Parse metrics
-    const avgVolume = metricData?.metric?.["10DayAverageTradingVolume"] 
-      ?? metricData?.metric?.avgVolume 
-      ?? null;
+    // Parse metrics (Finnhub's metric shape can vary)
+    const avgVolume =
+      metricData?.metric?.["10DayAverageTradingVolume"] ??
+      metricData?.metric?.avgVolume ??
+      metricData?.metric?.["10DayAverageTradingVolume"];
     const avgVol = safeNum(avgVolume);
 
     // Calculate relative volume
-    const relative_volume = (avgVol !== null && volume !== null && avgVol > 0)
-      ? Number((volume / avgVol).toFixed(4))
-      : null;
+    const relative_volume =
+      avgVol !== null && volume !== null && avgVol > 0 ? Number((volume / avgVol).toFixed(4)) : null;
 
-    // Return structured data
+    // Return structured data - FIXED: Only consider valid if price AND volume exist and are > 0
     return {
       symbol,
       name,
@@ -155,23 +173,22 @@ async function fetchSymbolData(symbol: string) {
       shares_float,
       relative_volume,
       avgVolume: avgVol,
-      hasData: c !== null || volume !== null
+      hasData: c !== null && c > 0 && volume !== null && volume > 0
     };
   } catch (err) {
-  console.log(`[ERROR] fetchSymbolData ${symbol}:`, typeof err === "object" && err && "message" in err ? String((err as any).message) : String(err));
+    console.log(
+      `[ERROR] fetchSymbolData ${symbol}:`,
+      typeof err === "object" && err && "message" in err ? String(err.message) : String(err)
+    );
     return null;
   }
 }
 
 // Process symbols with concurrency control
-async function mapWithConcurrency<T, R>(
-  items: T[], 
-  concurrency: number, 
-  fn: (item: T) => Promise<R>
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
+async function mapWithConcurrency(items, concurrency, fn) {
+  const results = new Array(items.length);
   let i = 0;
-  
+
   async function worker() {
     while (true) {
       const idx = i++;
@@ -179,24 +196,41 @@ async function mapWithConcurrency<T, R>(
       try {
         results[idx] = await fn(items[idx]);
       } catch (e) {
-  console.log(`[ERROR] Worker failed at index ${idx}:`, typeof e === "object" && e && "message" in e ? String((e as any).message) : String(e));
-        results[idx] = null as any;
+        console.log(
+          `[ERROR] Worker failed at index ${idx}:`,
+          typeof e === "object" && e && "message" in e ? String(e.message) : String(e)
+        );
+        results[idx] = null;
       }
     }
   }
-  
+
   await Promise.all(new Array(Math.max(1, concurrency)).fill(null).map(() => worker()));
   return results;
 }
 
 // Apply filters to a stock
-function passesFilters(stock: any, filters: any, comparisons: any[]): boolean {
-  // Price filters
+function passesFilters(stock, filters, comparisons) {
+  if (!stock) return false;
+
+  // ADDED: Stricter validation - reject invalid price/volume data
+  if (stock.price === null || stock.price <= 0) return false;
+  if (stock.volume === null || stock.volume <= 0) return false;
+
+  // Price filters - EXPLICIT CHECKS
   if (filters.price_min !== undefined && filters.price_min !== null) {
-    if (stock.price === null || stock.price < Number(filters.price_min)) return false;
+    const minPrice = Number(filters.price_min);
+    if (stock.price < minPrice) {
+      console.log(`[FILTER_DEBUG] ${stock.symbol} rejected: price ${stock.price} < min ${minPrice}`);
+      return false;
+    }
   }
   if (filters.price_max !== undefined && filters.price_max !== null) {
-    if (stock.price === null || stock.price > Number(filters.price_max)) return false;
+    const maxPrice = Number(filters.price_max);
+    if (stock.price > maxPrice) {
+      console.log(`[FILTER_DEBUG] ${stock.symbol} rejected: price ${stock.price} > max ${maxPrice}`);
+      return false;
+    }
   }
 
   // Float filters
@@ -225,21 +259,21 @@ function passesFilters(stock: any, filters: any, comparisons: any[]): boolean {
 
   // Relative volume filters
   if (filters.relative_volume_min !== undefined && filters.relative_volume_min !== null) {
-    if (stock.relative_volume === null || stock.relative_volume < Number(filters.relative_volume_min)) return false;
+    if (stock.relative_volume === null || stock.relative_volume < Number(filters.relative_volume_min))
+      return false;
   }
 
   // Volume filters
   if (filters.volume_min !== undefined && filters.volume_min !== null) {
-    if (stock.volume === null || stock.volume < Number(filters.volume_min)) return false;
+    if (stock.volume < Number(filters.volume_min)) return false;
   }
 
   // Comparisons (e.g., volume > shares_float)
   for (const cmp of comparisons) {
     const leftVal = stock[cmp.left] ?? null;
     const rightVal = stock[cmp.right] ?? null;
-    
     if (leftVal === null || rightVal === null) return false;
-    
+
     if (cmp.operator === ">" && !(leftVal > rightVal)) return false;
     if (cmp.operator === "<" && !(leftVal < rightVal)) return false;
     if (cmp.operator === "=" && !(leftVal === rightVal)) return false;
@@ -249,29 +283,31 @@ function passesFilters(stock: any, filters: any, comparisons: any[]): boolean {
 }
 
 // Main serve handler
-serve(async (req: Request) => {
-  console.log("[INIT] Screener invoked:", nowISO());
-  
+serve(async (req) => {
+  const VERSION = "v2.1-FILTER-FIX";
+  console.log(`[INIT] Screener invoked: ${nowISO()} - Version: ${VERSION}`);
+
   if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), { 
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
       status: 405,
-      headers: { "content-type": "application/json" }
+      headers: { "content-type": "application/json" },
     });
   }
 
-  let body: any = {};
+  let body = {};
   try {
     body = await req.json().catch(() => ({}));
   } catch (err) {
-    return new Response(JSON.stringify({ error: "Invalid JSON body" }), { 
+    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
       status: 400,
-      headers: { "content-type": "application/json" }
+      headers: { "content-type": "application/json" },
     });
   }
 
   const filters = body.filters || {};
   const comparisons = Array.isArray(body.comparisons) ? body.comparisons : [];
   const options = body.options || {};
+  const exchange = options.exchange || 'NASDAQ'; // Default to NASDAQ, can be 'NASDAQ', 'NYSE', or 'ALL'
   const maxSymbols = Math.min(Number(options.maxSymbols || MAX_SYMBOLS_TO_CHECK), 200);
   const orderBy = String(options.orderBy ?? "change_percent");
 
@@ -281,69 +317,72 @@ serve(async (req: Request) => {
   try {
     const startTime = Date.now();
 
-    // Step 1: Get list of US stocks
-    console.log("[STEP 1] Fetching US stock list...");
-    const allStocks = await fetchUSStockList();
-    
+    // Step 1: Get list of stocks from database
+    console.log(`[STEP 1] Fetching ${exchange} stock list from database...`);
+    const exchangeFilter = exchange === 'ALL' ? undefined : exchange;
+    const allStocks = await fetchStockTickers(exchangeFilter);
+
     if (!allStocks.length) {
-      return new Response(JSON.stringify({ 
-        error: "Failed to fetch stock list from Finnhub" 
-      }), { 
+      return new Response(JSON.stringify({ error: "Failed to fetch stock list from database" }), {
         status: 500,
-        headers: { "content-type": "application/json" }
+        headers: { "content-type": "application/json" },
       });
     }
 
     // Step 2: Limit to maxSymbols (randomly sample to get variety)
     const symbolsToCheck = allStocks
-      .sort(() => Math.random() - 0.5) // Shuffle
+      .sort(() => Math.random() - 0.5)
       .slice(0, maxSymbols)
-      .map(s => s.symbol);
+      .map((s) => s.symbol);
 
     console.log(`[STEP 2] Checking ${symbolsToCheck.length} symbols`);
 
-    // Step 3: Fetch data for each symbol with concurrency
-    console.log("[STEP 3] Fetching data from Finnhub...");
-    const stocksData = await mapWithConcurrency(
-      symbolsToCheck,
-      CONCURRENCY,
-      async (symbol: string) => {
-        const data = await fetchSymbolData(symbol);
-        if (data && data.hasData) {
-          console.log(`[✓] ${symbol}: $${data.price} (${data.change_percent}%)`);
-        }
-        return data;
-      }
-    );
+    // Step 3: Fetch data for each symbol with concurrency - NO LOGGING during fetch
+    console.log("[STEP 3] Fetching data from Finnhub... (this may take a while)");
+    const stocksData = await mapWithConcurrency(symbolsToCheck, CONCURRENCY, async (symbol) => {
+      const data = await fetchSymbolData(symbol);
+      // NO LOGGING HERE - wait until after filtering
+      return data;
+    });
 
-    // Step 4: Filter out nulls and apply user filters
+    // Step 4: Filter out nulls and apply user filters - FIXED: Added logging after filtering
     console.log("[STEP 4] Applying filters...");
-    const validStocks = stocksData.filter(s => s !== null && s.hasData);
-    const filteredStocks = validStocks.filter(stock => 
-      passesFilters(stock, filters, comparisons)
-    );
-
+    const validStocks = stocksData.filter((s) => s !== null && s.hasData);
+    
+    // Debug: Log a few stocks before filtering
+    console.log("[DEBUG] Sample stocks before filtering:");
+    validStocks.slice(0, 3).forEach(s => {
+      console.log(`  ${s.symbol}: price=${s.price}, change=${s.change_percent}%, vol=${s.volume}, float=${s.shares_float}, mcap=${s.market_cap}`);
+    });
+    
+    const filteredStocks = validStocks.filter((stock) => {
+      const passes = passesFilters(stock, filters, comparisons);
+      // Debug: Log why stocks are rejected
+      if (!passes && validStocks.indexOf(stock) < 5) {
+        console.log(`  [REJECTED] ${stock.symbol}: price=${stock.price}, change=${stock.change_percent}%`);
+      }
+      return passes;
+    });
+    
     console.log(`[RESULT] ${validStocks.length} stocks with data, ${filteredStocks.length} passed filters`);
-
-    // Step 5: Sort results
-    if (orderBy === "relative_volume") {
-      filteredStocks.sort((a, b) => {
-        if (!a || !b) return 0;
-        return ((b.relative_volume ?? -Infinity) - (a.relative_volume ?? -Infinity));
-      });
-    } else if (orderBy === "volume") {
-      filteredStocks.sort((a, b) => {
-        if (!a || !b) return 0;
-        return ((b.volume ?? -Infinity) - (a.volume ?? -Infinity));
-      });
-    } else {
-      // Default: sort by change_percent
-      filteredStocks.sort((a, b) => {
-        if (!a || !b) return 0;
-        return ((b.change_percent ?? -Infinity) - (a.change_percent ?? -Infinity));
+    
+    // Log sample of filtered results
+    if (filteredStocks.length > 0) {
+      console.log(`[FILTERED RESULTS] Sample of ${Math.min(10, filteredStocks.length)} stocks that PASSED filters:`);
+      filteredStocks.slice(0, 10).forEach(stock => {
+        console.log(`  [✓] ${stock.symbol}: ${stock.price} (${stock.change_percent}%) Vol: ${stock.volume} Float: ${stock.shares_float}`);
       });
     }
 
+    // Step 5: Sort results
+    if (orderBy === "relative_volume") {
+      filteredStocks.sort((a, b) => (b.relative_volume ?? -Infinity) - (a.relative_volume ?? -Infinity));
+    } else if (orderBy === "volume") {
+      filteredStocks.sort((a, b) => (b.volume ?? -Infinity) - (a.volume ?? -Infinity));
+    } else {
+      // Default: sort by change_percent
+      filteredStocks.sort((a, b) => (b.change_percent ?? -Infinity) - (a.change_percent ?? -Infinity));
+    }
 
     // Step 6: Paginate
     const offset = Number(options.offset ?? 0);
@@ -351,11 +390,11 @@ serve(async (req: Request) => {
     const paginatedResults = filteredStocks.slice(offset, offset + limit);
 
     // Step 7: Upsert results into Supabase
-  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    if (supabase) {
       try {
         const upsertPayload = paginatedResults
-          .filter((stock: any) => stock && stock.symbol)
-          .map((stock: any) => ({
+          .filter((stock) => stock && stock.symbol)
+          .map((stock) => ({
             symbol: stock.symbol,
             name: stock.name ?? null,
             price: stock.price ?? null,
@@ -365,68 +404,80 @@ serve(async (req: Request) => {
             market_cap: stock.market_cap ?? null,
             float_shares: stock.shares_float ?? null,
             shares_float: stock.shares_float ?? null,
-            updated_at: new Date().toISOString()
+            updated_at: new Date().toISOString(),
           }));
+
         if (upsertPayload.length > 0) {
-          const { error } = await supabase
-            .from('stocks')
-            .upsert(upsertPayload, { onConflict: ['symbol'] });
+          const { error } = await supabase.from("stocks").upsert(upsertPayload, {
+            onConflict: ["symbol"],
+          });
+
           if (error) {
-            console.log('[SUPABASE ERROR]', typeof error === "object" && error && "message" in error ? String((error as any).message) : String(error));
+            console.log(
+              "[SUPABASE ERROR]",
+              typeof error === "object" && error && "message" in error ? String(error.message) : String(error)
+            );
           } else {
             console.log(`[SUPABASE] Upserted ${upsertPayload.length} stocks`);
           }
         } else {
-          console.log('[SUPABASE] No valid stocks to upsert');
+          console.log("[SUPABASE] No valid stocks to upsert");
         }
       } catch (err) {
-  console.log('[SUPABASE ERROR]', typeof err === "object" && err && "message" in err ? String((err as any).message) : String(err));
+        console.log(
+          "[SUPABASE ERROR]",
+          typeof err === "object" && err && "message" in err ? String(err.message) : String(err)
+        );
       }
     } else {
-  console.log('[SUPABASE] Missing URL or service role key, skipping DB update');
+      console.log("[SUPABASE] Missing URL or service role key, skipping DB update");
     }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-
     console.log(`[COMPLETE] Returned ${paginatedResults.length} results in ${duration}s`);
 
-    return new Response(JSON.stringify({
-      success: true,
-      count: paginatedResults.length,
-      total_matched: filteredStocks.length,
-      total_checked: validStocks.length,
-      results: paginatedResults
-        .filter((stock: any) => stock)
-        .map((stock: any) => ({
-          symbol: stock.symbol,
-          name: stock.name,
-          price: stock.price,
-          change_percent: stock.change_percent,
-          volume: stock.volume,
-          relative_volume: stock.relative_volume,
-          market_cap: stock.market_cap,
-          shares_float: stock.shares_float
-        })),
-      stats: {
-        symbols_checked: symbolsToCheck.length,
-        symbols_with_data: validStocks.length,
-        symbols_matched: filteredStocks.length,
-        api_calls_used: apiCallTimestamps.length,
-        duration_seconds: parseFloat(duration)
+    return new Response(
+      JSON.stringify({
+        success: true,
+        count: paginatedResults.length,
+        total_matched: filteredStocks.length,
+        total_checked: validStocks.length,
+        results: paginatedResults
+          .filter((stock) => stock)
+          .map((stock) => ({
+            symbol: stock.symbol,
+            name: stock.name,
+            price: stock.price,
+            change_percent: stock.change_percent,
+            volume: stock.volume,
+            relative_volume: stock.relative_volume,
+            market_cap: stock.market_cap,
+            shares_float: stock.shares_float,
+          })),
+        stats: {
+          symbols_checked: symbolsToCheck.length,
+          symbols_with_data: validStocks.length,
+          symbols_matched: filteredStocks.length,
+          api_calls_used: apiCallTimestamps.length,
+          duration_seconds: parseFloat(duration),
+        },
+      }),
+      {
+        headers: { "content-type": "application/json" },
+        status: 200,
       }
-    }), {
-      headers: { "content-type": "application/json" },
-      status: 200
-    });
-
-  } catch (err: any) {
+    );
+  } catch (err) {
     console.log("[ERROR] Fatal:", String(err?.message ?? err));
-    return new Response(JSON.stringify({ 
-      error: String(err?.message ?? err),
-      stack: err?.stack
-    }), { 
-      status: 500,
-      headers: { "content-type": "application/json" }
-    });
+    return new Response(
+      JSON.stringify({
+        error: String(err?.message ?? err),
+        stack: err?.stack,
+      }),
+      {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }
+    );
   }
 });
