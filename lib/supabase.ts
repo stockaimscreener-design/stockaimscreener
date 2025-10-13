@@ -59,6 +59,7 @@ export interface ScreenerComparison {
 }
 
 export interface ScreenerOptions {
+  exchange?: 'NASDAQ' | 'NYSE'   // ✅ add this line
   maxSymbols?: number
   orderBy?: 'change_percent' | 'volume' | 'relative_volume'
   offset?: number

@@ -62,11 +62,15 @@ export default function ScreenerForm({ onSubmit, loading }: ScreenerFormProps) {
         <label className="block text-sm font-medium text-gray-700 mb-2">
           Exchange
         </label>
-        <select
-          value={options.exchange}
-          onChange={(e) => setOptions(prev => ({ ...prev, exchange: e.target.value as any }))}
-          className="input-field"
-        >
+        <select value={options.exchange ?? 'ALL'}
+        onChange={(e) => {
+        const value = e.target.value
+        setOptions(prev => ({...prev,exchange: value === 'ALL' ? undefined : (value as 'NASDAQ' | 'NYSE')
+
+        }))
+      }}
+
+  className="input-field">
           <option value="NASDAQ">NASDAQ</option>
           <option value="NYSE">NYSE</option>
           <option value="ALL">All Exchanges</option>

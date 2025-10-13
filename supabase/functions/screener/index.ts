@@ -1,7 +1,7 @@
 // supabase/functions/screener/index.ts
 // Real-time Finnhub screener - queries based on user filters
 // ENV: FINNHUB_KEY
-import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
+//import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 // Deno-compatible ESM import for supabase-js
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -285,7 +285,9 @@ function passesFilters(stock, filters, comparisons) {
 }
 
 // Main serve handler
-serve(async (req) => {
+//
+//serve(async (req) => {
+export default async function handler(req: Request) {
   const VERSION = "v2.1-FILTER-FIX";
   console.log(`[INIT] Screener invoked: ${nowISO()} - Version: ${VERSION}`);
 
