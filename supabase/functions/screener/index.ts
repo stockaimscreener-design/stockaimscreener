@@ -1,7 +1,7 @@
 // supabase/functions/screener/index.ts
 // Real-time Finnhub screener - queries based on user filters
 // ENV: FINNHUB_KEY
-//import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
+import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 // Deno-compatible ESM import for supabase-js
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -285,22 +285,11 @@ function passesFilters(stock, filters, comparisons) {
 }
 
 // Main serve handler
-//
-//serve(async (req) => {
-export default async function handler(req: Request) {
+serve(async (req) => {
   const VERSION = "v2.1-FILTER-FIX";
   console.log(`[INIT] Screener invoked: ${nowISO()} - Version: ${VERSION}`);
 
-  console.log('[DEBUG] === REQUEST HEADERS ===');
-  for (const [key, value] of req.headers.entries()) {
-    console.log(`[DEBUG] Header: ${key} = ${value.substring(0, 50)}${value.length > 50 ? '...' : ''}`);
-  }
-  console.log('[DEBUG] === END HEADERS ===');
-
-  // Check authorization
-  const authHeader = req.headers.get('Authorization');
-  console.log('[DEBUG] Authorization header present:', !!authHeader);
-  console.log('[DEBUG] Authorization value:', authHeader || 'MISSING');
+  
 
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), {
