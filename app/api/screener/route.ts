@@ -3,18 +3,35 @@ import { NextRequest, NextResponse } from 'next/server'
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    ///j
-    // Forward the request to your Supabase Edge Function
-    const response = await fetch(`${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/screener`, {
+    
+     // Use ANON key instead of SERVICE_ROLE key for local development
+     const authKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    
+     console.log('Environment check:')
+     console.log('SUPABASE_URL:', process.env.NEXT_PUBLIC_SUPABASE_URL)
+     console.log('ANON_KEY exists:', !!authKey)
+     
+     if (!authKey) {
+       throw new Error('SUPABASE_ANON_KEY is not set')
+     }
+     
+     const url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/functions/v1/screener`
+     console.log('Calling URL:', url)
+
+    const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}`,
+        'Authorization': `Bearer ${authKey}`,
       },
       body: JSON.stringify(body),
     })
 
+    console.log('Response status:', response.status)
+    
     if (!response.ok) {
+      const errorText = await response.text()
+      console.error('Edge function error response:', errorText)
       throw new Error(`Edge function error: ${response.status}`)
     }
 
@@ -29,4 +46,3 @@ export async function POST(request: NextRequest) {
     )
   }
 }
-

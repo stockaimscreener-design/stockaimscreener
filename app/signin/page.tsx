@@ -14,8 +14,33 @@ export default function SignInPage() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    // In a real app, you would handle authentication here
-    console.log('Form submitted:', { isSignUp, formData })
+    
+    if (isSignUp) {
+      if (formData.password !== formData.confirmPassword) {
+        alert('Passwords do not match')
+        return
+      }
+      
+      try {
+        // For now, just show success message
+        alert('Account created successfully! (Demo mode - no actual account created)')
+        console.log('Sign up:', formData)
+      } catch (error) {
+        alert('Sign up failed. Please try again.')
+        console.error('Sign up error:', error)
+      }
+    } else {
+      try {
+        // For now, just show success message
+        alert('Signed in successfully! (Demo mode - no actual authentication)')
+        console.log('Sign in:', formData)
+        // In a real app, redirect to dashboard
+        // window.location.href = '/'
+      } catch (error) {
+        alert('Sign in failed. Please check your credentials.')
+        console.error('Sign in error:', error)
+      }
+    }
   }
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {

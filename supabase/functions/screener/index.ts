@@ -5,13 +5,15 @@ import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
 // Deno-compatible ESM import for supabase-js
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FINNHUB_KEY = Deno.env.get("FINNHUB_KEY") ?? "";
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+// NEW:
+const FINNHUB_KEY = Deno.env.get("FINNHUB_API_KEY") ?? "";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? ""; // Auto-injected by Supabase
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? ""; // Auto-injected
 
+// Use ANON_KEY instead of SERVICE_ROLE_KEY for the client
 let supabase = null;
-if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 }
 
 if (!FINNHUB_KEY) console.error("[INIT] Missing FINNHUB_KEY");
@@ -286,6 +288,17 @@ function passesFilters(stock, filters, comparisons) {
 serve(async (req) => {
   const VERSION = "v2.1-FILTER-FIX";
   console.log(`[INIT] Screener invoked: ${nowISO()} - Version: ${VERSION}`);
+
+  console.log('[DEBUG] === REQUEST HEADERS ===');
+  for (const [key, value] of req.headers.entries()) {
+    console.log(`[DEBUG] Header: ${key} = ${value.substring(0, 50)}${value.length > 50 ? '...' : ''}`);
+  }
+  console.log('[DEBUG] === END HEADERS ===');
+
+  // Check authorization
+  const authHeader = req.headers.get('Authorization');
+  console.log('[DEBUG] Authorization header present:', !!authHeader);
+  console.log('[DEBUG] Authorization value:', authHeader || 'MISSING');
 
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), {

@@ -47,7 +47,7 @@ export default function SearchBar({ onSearch, placeholder = "Search stocks..." }
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder={placeholder}
-          className="block w-full pl-10 pr-12 py-3 border border-gray-300 rounded-lg leading-5 bg-white placeholder-gray-500 focus:outline-none focus:placeholder-gray-400 focus:ring-2 focus:ring-white focus:border-transparent text-lg"
+          className="block w-full pl-10 pr-12 py-3 border border-gray-300 rounded-lg leading-5 bg-white placeholder-gray-500 focus:outline-none focus:placeholder-gray-400 focus:ring-2 focus:ring-white focus:border-transparent text-lg text-gray-900"
         />
         <div className="absolute inset-y-0 right-0 flex items-center pr-3">
           <button

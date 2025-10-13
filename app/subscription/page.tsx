@@ -25,7 +25,7 @@ export default function SubscriptionPage() {
     },
     {
       name: 'Pro',
-      price: '$29',
+      price: '$9',
       period: 'month',
       features: [
         'Unlimited stock screening',
@@ -42,7 +42,7 @@ export default function SubscriptionPage() {
     },
     {
       name: 'Premium',
-      price: '$99',
+      price: '$29',
       period: 'month',
       features: [
         'Everything in Pro',

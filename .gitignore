@@ -39,3 +39,10 @@ next-env.d.ts
 .branches
 .temp
 
+# Environment variables
+.env.local
+.env*.local
+.env
+
+# Supabase
+supabase/.env
