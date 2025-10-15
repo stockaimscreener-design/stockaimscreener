@@ -1,0 +1,55 @@
+# .github/workflows/delta-update.yml
+# Delta update: Every 5 minutes during market hours
+name: Delta Stock Update (Every 5min)
+
+on:
+  schedule:
+    # Every 5 minutes (UTC)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force update even outside market hours'
+        required: false
+        default: 'false'
+
+jobs:
+  delta-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if market hours
+        id: check-hours
+        run: |
+          # Get current time in ET
+          HOUR=$(TZ=America/New_York date +%H)
+          DAY=$(TZ=America/New_York date +%u)
+          
+          # Market hours: Mon-Fri (1-5), 9:30 AM - 4:00 PM ET
+          if [ "$DAY" -ge 1 ] && [ "$DAY" -le 5 ] && [ "$HOUR" -ge 9 ] && [ "$HOUR" -lt 16 ]; then
+            echo "market_open=true" >> $GITHUB_OUTPUT
+          else
+            echo "market_open=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delta Update
+        if: steps.check-hours.outputs.market_open == 'true' || github.event.inputs.force == 'true'
+        run: |
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_FUNCTIONS_URL }}/update-stocks?mode=delta" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+          
+          echo "Response: $body"
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "Error: HTTP $http_code"
+            exit 1
+          fi
+
+      - name: Log skip
+        if: steps.check-hours.outputs.market_open == 'false' && github.event.inputs.force != 'true'
+        run: echo "Skipped - Market closed"

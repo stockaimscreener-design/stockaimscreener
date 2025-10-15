@@ -1,487 +1,475 @@
 // supabase/functions/screener/index.ts
-// Real-time Finnhub screener - queries based on user filters
-// ENV: FINNHUB_KEY
 import { serve } from "https://deno.land/std@0.200.0/http/server.ts";
-// Deno-compatible ESM import for supabase-js
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.3";
 
-// NEW:
-const FINNHUB_KEY = Deno.env.get("FINNHUB_API_KEY") ?? "";
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? ""; // Auto-injected by Supabase
-const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? ""; // Auto-injected
+type Filters = {
+  price_min?: number;
+  price_max?: number;
+  float_max?: number;
+  market_cap_max?: number;
+  change_min?: number;
+  change_max?: number;
+  relative_volume_min?: number;
+  volume_min?: number;
+};
 
-// Use ANON_KEY instead of SERVICE_ROLE_KEY for the client
-let supabase = null;
-if (SUPABASE_URL && SUPABASE_ANON_KEY) {
-  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+type QuoteResult = {
+  symbol: string;
+  name: string | null;
+  price: number | null;
+  change_percent: number | null;
+  volume: number | null;
+  market_cap: number | null;
+  shares_float: number | null;
+  relative_volume: number | null;
+  raw?: any;
+};
+
+const FMP_KEY = Deno.env.get("FMP_KEY") ?? "";
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+// Configuration
+const YAHOO_BATCH_SIZE = 100; // Yahoo supports up to 100+ symbols
+const FMP_BATCH_DELAY = 100; // Minimal delay between FMP calls
+const FRESHNESS_MS = 1000 * 60 * 15; // 15 minutes for price data (more aggressive)
+const PROFILE_FRESHNESS_MS = 1000 * 60 * 60 * 24; // 24 hours for profile data (less frequent changes)
+const DB_BATCH_SIZE = 500; // Larger batch for DB operations
+
+function computeRelativeVolume(today: number | null, avg10: number | null): number | null {
+  if (today == null || avg10 == null || avg10 === 0) return null;
+  return Number((today / avg10).toFixed(2));
 }
 
-if (!FINNHUB_KEY) console.error("[INIT] Missing FINNHUB_KEY");
-
-// --- Rate limiting for free tier (60 calls/min) ---
-const CALLS_PER_MINUTE = 55; // Buffer of 5
-const RATE_LIMIT_WINDOW = 60000;
-const CONCURRENCY = 3; // Process 3 symbols in parallel
-const MAX_SYMBOLS_TO_CHECK = 100; // Limit to prevent timeout
-
-let apiCallTimestamps = [];
-
-async function rateLimitedFetch(url) {
-  const now = Date.now();
-  apiCallTimestamps = apiCallTimestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW);
-
-  if (apiCallTimestamps.length >= CALLS_PER_MINUTE) {
-    const oldestCall = apiCallTimestamps[0];
-    const waitTime = RATE_LIMIT_WINDOW - (now - oldestCall) + 1000;
-    console.log(`[RATE_LIMIT] Waiting ${Math.ceil(waitTime / 1000)}s`);
-    await new Promise((resolve) => setTimeout(resolve, waitTime));
-    apiCallTimestamps = apiCallTimestamps.filter((ts) => Date.now() - ts < RATE_LIMIT_WINDOW);
-  }
-
-  apiCallTimestamps.push(Date.now());
-  const res = await fetch(url);
-
-  if (res.status === 429) {
-    // Respect Retry-After header if present
-    const retryAfter = parseInt(res.headers.get("retry-after") || "60", 10);
-    console.log(`[RATE_LIMIT] Got 429, waiting ${retryAfter}s`);
-    await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
-    // After waiting, call again
-    return rateLimitedFetch(url);
-  }
-
-  return res;
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function safeNum(v) {
-  if (v === null || v === undefined) return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-async function finnhubFetch(path, params = {}) {
-  const url = new URL(`https://finnhub.io/api/v1/${path}`);
-  url.searchParams.set("token", FINNHUB_KEY);
-  for (const k of Object.keys(params)) url.searchParams.set(k, String(params[k]));
-
+// OPTIMIZED: Batch fetch from Yahoo - increased batch size
+async function fetchBatchFromYahoo(symbols: string[]): Promise<Map<string, Partial<QuoteResult>>> {
+  const results = new Map<string, Partial<QuoteResult>>();
+  
   try {
-    const res = await rateLimitedFetch(url.toString());
+    const symbolList = symbols.join(',');
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbolList)}`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`Finnhub ${path} HTTP ${res.status}: ${text}`);
+      console.error(`Yahoo fetch failed: ${res.status}`);
+      return results;
     }
-    // Try parse JSON; if it fails, bubble error
-    return await res.json();
-  } catch (err) {
-    console.log(
-      JSON.stringify({
-        timestamp: nowISO(),
-        level: "ERROR",
-        source: "FINNHUB_FETCH",
-        path,
-        message: typeof err === "object" && err && "message" in err ? String(err.message) : String(err),
-      })
-    );
-    throw err;
+    
+    const data = await res.json();
+    
+    if (!data?.quoteResponse?.result) return results;
+    
+    for (const quote of data.quoteResponse.result) {
+      const symbol = quote.symbol;
+      const price = quote.regularMarketPrice ?? null;
+      const prevClose = quote.regularMarketPreviousClose ?? null;
+      const change_percent = (price != null && prevClose != null && prevClose !== 0)
+        ? Number((((price - prevClose) / prevClose) * 100).toFixed(4))
+        : null;
+      const volume = quote.regularMarketVolume ?? null;
+      const avg10 = quote.averageDailyVolume10Day ?? null;
+      const relative_volume = computeRelativeVolume(volume, avg10);
+      
+      results.set(symbol, {
+        symbol,
+        name: quote.longName ?? quote.shortName ?? null,
+        price,
+        change_percent,
+        volume,
+        market_cap: quote.marketCap ?? null,
+        shares_float: quote.floatShares ?? null,
+        relative_volume,
+        raw: quote
+      });
+    }
+  } catch (e) {
+    console.error('Yahoo fetch error:', e);
   }
-}
-
-// Get list of NASDAQ/NYSE stocks from our database
-async function fetchStockTickers(exchange?: 'NASDAQ' | 'NYSE') {
-  console.log(`[FETCH] Getting ${exchange || 'NASDAQ/NYSE'} stock symbols from database`);
-  try {
-    if (!supabase) {
-      console.log("[ERROR] Supabase client not initialized");
-      return [];
-    }
-
-    let query = supabase.from('stock_tickers').select('*');
-    
-    if (exchange) {
-      query = query.eq('exchange', exchange);
-    }
-    
-    const { data, error } = await query;
-    
-    if (error) {
-      console.log("[ERROR] fetchStockTickers:", error.message);
-      return [];
-    }
-    
-    if (!Array.isArray(data)) return [];
-    
-    console.log(`[FETCH] Found ${data.length} valid stocks from database`);
-    return data.map(ticker => ({
-      symbol: ticker.Symbol,
-      type: 'common',
-      description: ticker['Company Name']
-    }));
-  } catch (err) {
-    console.log(
-      "[ERROR] fetchStockTickers:",
-      typeof err === "object" && err && "message" in err ? String(err.message) : String(err)
-    );
-    return [];
-  }
-}
-
-// Fetch comprehensive data for a single symbol
-async function fetchSymbolData(symbol) {
-  try {
-    // Parallel fetch: quote, profile, and metrics (3 API calls per symbol)
-    const [quoteData, profileData, metricData] = await Promise.all([
-      finnhubFetch("quote", { symbol }).catch(() => null),
-      finnhubFetch("stock/profile2", { symbol }).catch(() => null),
-      finnhubFetch("stock/metric", { symbol, metric: "all" }).catch(() => null),
-    ]);
-
-    // Parse quote data
-    const c = safeNum(quoteData?.c);
-    const pc = safeNum(quoteData?.pc);
-    const change_percent =
-      c !== null && pc !== null && pc !== 0 ? Number(((c - pc) / pc * 100).toFixed(4)) : null;
-    const volume = safeNum(quoteData?.v ?? quoteData?.volume) ?? null;
-
-    // Parse profile data (market cap is in millions, convert to actual value)
-    const market_cap = safeNum(profileData?.marketCapitalization)
-      ? safeNum(profileData.marketCapitalization) * 1e6
-      : null;
-    const shares_float = safeNum(profileData?.shareOutstanding) ?? null;
-    const name = profileData?.name ?? null;
-
-    // Parse metrics (Finnhub's metric shape can vary)
-    const avgVolume =
-      metricData?.metric?.["10DayAverageTradingVolume"] ??
-      metricData?.metric?.avgVolume ??
-      metricData?.metric?.["10DayAverageTradingVolume"];
-    const avgVol = safeNum(avgVolume);
-
-    // Calculate relative volume
-    const relative_volume =
-      avgVol !== null && volume !== null && avgVol > 0 ? Number((volume / avgVol).toFixed(4)) : null;
-
-    // Return structured data - FIXED: Only consider valid if price AND volume exist and are > 0
-    return {
-      symbol,
-      name,
-      price: c,
-      change_percent,
-      volume,
-      market_cap,
-      shares_float,
-      relative_volume,
-      avgVolume: avgVol,
-      hasData: c !== null && c > 0 && volume !== null && volume > 0
-    };
-  } catch (err) {
-    console.log(
-      `[ERROR] fetchSymbolData ${symbol}:`,
-      typeof err === "object" && err && "message" in err ? String(err.message) : String(err)
-    );
-    return null;
-  }
-}
-
-// Process symbols with concurrency control
-async function mapWithConcurrency(items, concurrency, fn) {
-  const results = new Array(items.length);
-  let i = 0;
-
-  async function worker() {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) break;
-      try {
-        results[idx] = await fn(items[idx]);
-      } catch (e) {
-        console.log(
-          `[ERROR] Worker failed at index ${idx}:`,
-          typeof e === "object" && e && "message" in e ? String(e.message) : String(e)
-        );
-        results[idx] = null;
-      }
-    }
-  }
-
-  await Promise.all(new Array(Math.max(1, concurrency)).fill(null).map(() => worker()));
+  
   return results;
 }
 
-// Apply filters to a stock
-function passesFilters(stock, filters, comparisons) {
-  if (!stock) return false;
-
-  // ADDED: Stricter validation - reject invalid price/volume data
-  if (stock.price === null || stock.price <= 0) return false;
-  if (stock.volume === null || stock.volume <= 0) return false;
-
-  // Price filters - EXPLICIT CHECKS
-  if (filters.price_min !== undefined && filters.price_min !== null) {
-    const minPrice = Number(filters.price_min);
-    if (stock.price < minPrice) {
-      console.log(`[FILTER_DEBUG] ${stock.symbol} rejected: price ${stock.price} < min ${minPrice}`);
-      return false;
+// OPTIMIZED: Batch fetch from FMP profiles (reduced API calls)
+async function fetchBatchFromFMP(symbols: string[]): Promise<Map<string, Partial<QuoteResult>>> {
+  const results = new Map<string, Partial<QuoteResult>>();
+  if (!FMP_KEY || symbols.length === 0) return results;
+  
+  // FMP doesn't have true batch profile endpoint, so we minimize calls
+  // Only fetch for symbols that really need it
+  for (const symbol of symbols) {
+    try {
+      const url = `https://financialmodelingprep.com/stable/profile?symbol=${symbol}&apikey=${FMP_KEY}`;
+      const res = await fetch(url);
+      
+      if (!res.ok) continue;
+      
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) continue;
+      
+      const profile = data[0];
+      results.set(symbol, {
+        symbol,
+        name: profile.companyName ?? null,
+        market_cap: profile.mktCap ?? null,
+        shares_float: profile.sharesOutstanding ?? null,
+        raw: profile
+      });
+      
+      // Minimal delay to avoid rate limiting
+      if (symbols.indexOf(symbol) < symbols.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, FMP_BATCH_DELAY));
+      }
+    } catch (e) {
+      console.error(`FMP error for ${symbol}:`, e);
     }
   }
-  if (filters.price_max !== undefined && filters.price_max !== null) {
-    const maxPrice = Number(filters.price_max);
-    if (stock.price > maxPrice) {
-      console.log(`[FILTER_DEBUG] ${stock.symbol} rejected: price ${stock.price} > max ${maxPrice}`);
-      return false;
-    }
-  }
-
-  // Float filters
-  if (filters.float_min !== undefined && filters.float_min !== null) {
-    if (stock.shares_float === null || stock.shares_float < Number(filters.float_min)) return false;
-  }
-  if (filters.float_max !== undefined && filters.float_max !== null) {
-    if (stock.shares_float === null || stock.shares_float > Number(filters.float_max)) return false;
-  }
-
-  // Market cap filters
-  if (filters.market_cap_min !== undefined && filters.market_cap_min !== null) {
-    if (stock.market_cap === null || stock.market_cap < Number(filters.market_cap_min)) return false;
-  }
-  if (filters.market_cap_max !== undefined && filters.market_cap_max !== null) {
-    if (stock.market_cap === null || stock.market_cap > Number(filters.market_cap_max)) return false;
-  }
-
-  // Change percent filters
-  if (filters.change_min !== undefined && filters.change_min !== null) {
-    if (stock.change_percent === null || stock.change_percent < Number(filters.change_min)) return false;
-  }
-  if (filters.change_max !== undefined && filters.change_max !== null) {
-    if (stock.change_percent === null || stock.change_percent > Number(filters.change_max)) return false;
-  }
-
-  // Relative volume filters
-  if (filters.relative_volume_min !== undefined && filters.relative_volume_min !== null) {
-    if (stock.relative_volume === null || stock.relative_volume < Number(filters.relative_volume_min))
-      return false;
-  }
-
-  // Volume filters
-  if (filters.volume_min !== undefined && filters.volume_min !== null) {
-    if (stock.volume < Number(filters.volume_min)) return false;
-  }
-
-  // Comparisons (e.g., volume > shares_float)
-  for (const cmp of comparisons) {
-    const leftVal = stock[cmp.left] ?? null;
-    const rightVal = stock[cmp.right] ?? null;
-    if (leftVal === null || rightVal === null) return false;
-
-    if (cmp.operator === ">" && !(leftVal > rightVal)) return false;
-    if (cmp.operator === "<" && !(leftVal < rightVal)) return false;
-    if (cmp.operator === "=" && !(leftVal === rightVal)) return false;
-  }
-
-  return true;
+  
+  return results;
 }
 
-// Main serve handler
-serve(async (req) => {
-  const VERSION = "v2.1-FILTER-FIX";
-  console.log(`[INIT] Screener invoked: ${nowISO()} - Version: ${VERSION}`);
-
+// OPTIMIZED: Smart merge with priority logic
+function smartMerge(
+  primary: Partial<QuoteResult> | null, 
+  fallback: Partial<QuoteResult> | null
+): QuoteResult | null {
+  if (!primary || !primary.symbol) return null;
   
+  // Prioritize Yahoo for real-time data, FMP for profile data
+  return {
+    symbol: String(primary.symbol),
+    name: primary.name ?? fallback?.name ?? null,
+    price: primary.price ?? null, // Always from Yahoo (real-time)
+    change_percent: primary.change_percent ?? null, // Always from Yahoo
+    volume: primary.volume ?? null, // Always from Yahoo
+    relative_volume: primary.relative_volume ?? null, // Calculated from Yahoo
+    market_cap: primary.market_cap ?? fallback?.market_cap ?? null, // Yahoo first, FMP fallback
+    shares_float: primary.shares_float ?? fallback?.shares_float ?? null, // Yahoo first, FMP fallback
+    raw: { yahoo: primary.raw, fmp: fallback?.raw }
+  };
+}
 
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), {
-      status: 405,
-      headers: { "content-type": "application/json" },
+// OPTIMIZED: Intelligent cache with separate freshness for price vs profile data
+async function getCachedStocks(
+  symbols: string[], 
+  needsRealtime: boolean = true
+): Promise<Map<string, QuoteResult>> {
+  const cached = new Map<string, QuoteResult>();
+  
+  if (symbols.length === 0) return cached;
+  
+  const { data, error } = await supabase
+    .from("stocks")
+    .select("*")
+    .in("symbol", symbols);
+  
+  if (error) {
+    console.error('Cache lookup error:', error);
+    return cached;
+  }
+  
+  if (!data) return cached;
+  
+  const now = Date.now();
+  for (const row of data) {
+    if (!row.updated_at) continue;
+    
+    const age = now - new Date(row.updated_at).getTime();
+    
+    // Different freshness requirements based on data type
+    const freshnessThreshold = needsRealtime ? FRESHNESS_MS : PROFILE_FRESHNESS_MS;
+    
+    if (age > freshnessThreshold) continue;
+    
+    cached.set(row.symbol, {
+      symbol: row.symbol,
+      name: row.name ?? null,
+      price: row.price != null ? Number(row.price) : null,
+      change_percent: row.change_percent != null ? Number(row.change_percent) : null,
+      volume: row.volume != null ? Number(row.volume) : null,
+      market_cap: row.market_cap != null ? Number(row.market_cap) : null,
+      shares_float: row.shares_float != null ? Number(row.shares_float) : null,
+      relative_volume: row.relative_volume != null ? Number(row.relative_volume) : null,
+      raw: row.raw ?? null
     });
   }
+  
+  return cached;
+}
 
-  let body = {};
-  try {
-    body = await req.json().catch(() => ({}));
-  } catch (err) {
-    return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
-  const filters = body.filters || {};
-  const comparisons = Array.isArray(body.comparisons) ? body.comparisons : [];
-  const options = body.options || {};
-  const exchange = options.exchange || 'NASDAQ'; // Default to NASDAQ, can be 'NASDAQ', 'NYSE', or 'ALL'
-  const maxSymbols = Math.min(Number(options.maxSymbols || MAX_SYMBOLS_TO_CHECK), 200);
-  const orderBy = String(options.orderBy ?? "change_percent");
-
-  console.log("[REQUEST] Filters:", JSON.stringify(filters));
-  console.log("[REQUEST] Max symbols to check:", maxSymbols);
-
-  try {
-    const startTime = Date.now();
-
-    // Step 1: Get list of stocks from database
-    console.log(`[STEP 1] Fetching ${exchange} stock list from database...`);
-    const exchangeFilter = exchange === 'ALL' ? undefined : exchange;
-    const allStocks = await fetchStockTickers(exchangeFilter);
-
-    if (!allStocks.length) {
-      return new Response(JSON.stringify({ error: "Failed to fetch stock list from database" }), {
-        status: 500,
-        headers: { "content-type": "application/json" },
-      });
+// OPTIMIZED: Larger batch upserts with better error handling
+async function batchUpsertStocks(stocks: QuoteResult[]): Promise<void> {
+  if (stocks.length === 0) return;
+  
+  const rows = stocks.map(s => ({
+    symbol: s.symbol,
+    name: s.name,
+    price: s.price,
+    change_percent: s.change_percent,
+    volume: s.volume,
+    market_cap: s.market_cap,
+    shares_float: s.shares_float,
+    relative_volume: s.relative_volume,
+    raw: s.raw ?? null,
+    updated_at: new Date().toISOString()
+  }));
+  
+  // Larger chunks for better performance
+  for (let i = 0; i < rows.length; i += DB_BATCH_SIZE) {
+    const chunk = rows.slice(i, i + DB_BATCH_SIZE);
+    const { error } = await supabase
+      .from("stocks")
+      .upsert(chunk, { onConflict: "symbol", ignoreDuplicates: false });
+    
+    if (error) {
+      console.error(`DB upsert error (batch ${i}):`, error);
     }
+  }
+}
 
-    // Step 2: Limit to maxSymbols (randomly sample to get variety)
-    const symbolsToCheck = allStocks
-      .sort(() => Math.random() - 0.5)
-      .slice(0, maxSymbols)
-      .map((s) => s.symbol);
-
-    console.log(`[STEP 2] Checking ${symbolsToCheck.length} symbols`);
-
-    // Step 3: Fetch data for each symbol with concurrency - NO LOGGING during fetch
-    console.log("[STEP 3] Fetching data from Finnhub... (this may take a while)");
-    const stocksData = await mapWithConcurrency(symbolsToCheck, CONCURRENCY, async (symbol) => {
-      const data = await fetchSymbolData(symbol);
-      // NO LOGGING HERE - wait until after filtering
-      return data;
-    });
-
-    // Step 4: Filter out nulls and apply user filters - FIXED: Added logging after filtering
-    console.log("[STEP 4] Applying filters...");
-    const validStocks = stocksData.filter((s) => s !== null && s.hasData);
+// OPTIMIZED: Parallel fetching strategy with intelligent batching
+async function enrichSymbols(symbols: string[]): Promise<QuoteResult[]> {
+  const results: QuoteResult[] = [];
+  const startTime = Date.now();
+  
+  // Step 1: Check cache first (single DB query)
+  const cached = await getCachedStocks(symbols, true);
+  const uncachedSymbols = symbols.filter(s => !cached.has(s));
+  
+  results.push(...Array.from(cached.values()));
+  
+  console.log(`✓ Cache: ${cached.size}/${symbols.length} hits (${((cached.size/symbols.length)*100).toFixed(1)}%)`);
+  
+  if (uncachedSymbols.length === 0) {
+    console.log(`✓ Performance: ${Date.now() - startTime}ms (100% cached)`);
+    return results;
+  }
+  
+  console.log(`→ Fetching ${uncachedSymbols.length} symbols from APIs...`);
+  
+  // Step 2: Fetch ALL uncached symbols from Yahoo in larger batches
+  const yahooResults = new Map<string, Partial<QuoteResult>>();
+  const yahooStartTime = Date.now();
+  
+  for (let i = 0; i < uncachedSymbols.length; i += YAHOO_BATCH_SIZE) {
+    const batch = uncachedSymbols.slice(i, i + YAHOO_BATCH_SIZE);
+    const batchResults = await fetchBatchFromYahoo(batch);
     
-    // Debug: Log a few stocks before filtering
-    console.log("[DEBUG] Sample stocks before filtering:");
-    validStocks.slice(0, 3).forEach(s => {
-      console.log(`  ${s.symbol}: price=${s.price}, change=${s.change_percent}%, vol=${s.volume}, float=${s.shares_float}, mcap=${s.market_cap}`);
-    });
-    
-    const filteredStocks = validStocks.filter((stock) => {
-      const passes = passesFilters(stock, filters, comparisons);
-      // Debug: Log why stocks are rejected
-      if (!passes && validStocks.indexOf(stock) < 5) {
-        console.log(`  [REJECTED] ${stock.symbol}: price=${stock.price}, change=${stock.change_percent}%`);
+    for (const [symbol, data] of batchResults.entries()) {
+      yahooResults.set(symbol, data);
+    }
+  }
+  
+  console.log(`✓ Yahoo: ${yahooResults.size}/${uncachedSymbols.length} fetched in ${Date.now() - yahooStartTime}ms`);
+  
+  // Step 3: Identify symbols missing critical data from Yahoo
+  const needsFMP: string[] = [];
+  for (const symbol of uncachedSymbols) {
+    const yahoo = yahooResults.get(symbol);
+    if (yahoo && yahoo.price) {
+      // Only fetch from FMP if missing market_cap OR shares_float
+      if (!yahoo.market_cap || !yahoo.shares_float) {
+        needsFMP.push(symbol);
       }
-      return passes;
-    });
-    
-    console.log(`[RESULT] ${validStocks.length} stocks with data, ${filteredStocks.length} passed filters`);
-    
-    // Log sample of filtered results
-    if (filteredStocks.length > 0) {
-      console.log(`[FILTERED RESULTS] Sample of ${Math.min(10, filteredStocks.length)} stocks that PASSED filters:`);
-      filteredStocks.slice(0, 10).forEach(stock => {
-        console.log(`  [✓] ${stock.symbol}: ${stock.price} (${stock.change_percent}%) Vol: ${stock.volume} Float: ${stock.shares_float}`);
-      });
     }
-
-    // Step 5: Sort results
-    if (orderBy === "relative_volume") {
-      filteredStocks.sort((a, b) => (b.relative_volume ?? -Infinity) - (a.relative_volume ?? -Infinity));
-    } else if (orderBy === "volume") {
-      filteredStocks.sort((a, b) => (b.volume ?? -Infinity) - (a.volume ?? -Infinity));
-    } else {
-      // Default: sort by change_percent
-      filteredStocks.sort((a, b) => (b.change_percent ?? -Infinity) - (a.change_percent ?? -Infinity));
+  }
+  
+  // Step 4: Fetch missing data from FMP (minimized calls)
+  let fmpResults = new Map<string, Partial<QuoteResult>>();
+  if (needsFMP.length > 0) {
+    const fmpStartTime = Date.now();
+    console.log(`→ FMP needed for ${needsFMP.length} symbols (missing profile data)`);
+    fmpResults = await fetchBatchFromFMP(needsFMP);
+    console.log(`✓ FMP: ${fmpResults.size}/${needsFMP.length} fetched in ${Date.now() - fmpStartTime}ms`);
+  } else {
+    console.log(`✓ FMP: 0 calls needed (Yahoo provided all data)`);
+  }
+  
+  // Step 5: Merge and create final results
+  const newStocks: QuoteResult[] = [];
+  for (const symbol of uncachedSymbols) {
+    const yahoo = yahooResults.get(symbol);
+    if (!yahoo || !yahoo.price) continue; // Skip if no price
+    
+    const fmp = fmpResults.get(symbol);
+    const merged = smartMerge(yahoo, fmp);
+    
+    if (merged) {
+      newStocks.push(merged);
+      results.push(merged);
     }
+  }
+  
+  // Step 6: Batch upsert to DB (single operation per chunk)
+  if (newStocks.length > 0) {
+    const dbStartTime = Date.now();
+    await batchUpsertStocks(newStocks);
+    console.log(`✓ DB: ${newStocks.length} stocks cached in ${Date.now() - dbStartTime}ms`);
+  }
+  
+  const totalTime = Date.now() - startTime;
+  console.log(`✓ Performance: ${totalTime}ms total | ${(totalTime/symbols.length).toFixed(1)}ms per symbol`);
+  
+  return results;
+}
 
-    // Step 6: Paginate
-    const offset = Number(options.offset ?? 0);
-    const limit = Number(options.limit ?? 50);
-    const paginatedResults = filteredStocks.slice(offset, offset + limit);
+// Build FMP screener query
+function buildFmpScreenerQuery(filters: Filters, limit = 250): string {
+  const params = new URLSearchParams();
+  params.set("limit", String(limit));
+  params.set("exchange", "NASDAQ,NYSE");
+  
+  if (filters.price_min != null) params.set("priceMoreThan", String(filters.price_min));
+  if (filters.price_max != null) params.set("priceLowerThan", String(filters.price_max));
+  if (filters.market_cap_max != null) params.set("marketCapLowerThan", String(filters.market_cap_max));
+  if (filters.volume_min != null) params.set("volumeMoreThan", String(filters.volume_min));
+  
+  return params.toString();
+}
 
-    // Step 7: Upsert results into Supabase
-    if (supabase) {
+serve(async (req) => {
+  const requestStart = Date.now();
+  
+  try {
+    if (req.method !== "POST") {
+      return new Response(
+        JSON.stringify({ error: "POST only" }),
+        { status: 405, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    
+    const body = await req.json();
+    const filters: Filters = body.filters || {};
+    const limit = Number(body.limit ?? 250);
+    
+    console.log(`\n=== Screener Request ===`);
+    console.log(`Filters:`, JSON.stringify(filters));
+    console.log(`Limit: ${limit}`);
+    
+    // Step 1: Get candidates from FMP screener
+    const fmpQS = buildFmpScreenerQuery(filters, limit * 2);
+    const fmpUrl = `https://financialmodelingprep.com/stable/company-screener?${fmpQS}&apikey=${encodeURIComponent(FMP_KEY)}`;
+    
+    const fmpStart = Date.now();
+    const fmpRes = await fetch(fmpUrl);
+    
+    if (!fmpRes.ok) {
+      const errorText = await fmpRes.text();
+      console.error(`FMP screener failed: ${fmpRes.status}`, errorText);
+      
+      let errorData;
       try {
-        const upsertPayload = paginatedResults
-          .filter((stock) => stock && stock.symbol)
-          .map((stock) => ({
-            symbol: stock.symbol,
-            name: stock.name ?? null,
-            price: stock.price ?? null,
-            change_percent: stock.change_percent ?? null,
-            volume: stock.volume ?? null,
-            relative_volume: stock.relative_volume ?? null,
-            market_cap: stock.market_cap ?? null,
-            float_shares: stock.shares_float ?? null,
-            shares_float: stock.shares_float ?? null,
-            updated_at: new Date().toISOString(),
-          }));
-
-        if (upsertPayload.length > 0) {
-          const { error } = await supabase.from("stocks").upsert(upsertPayload, {
-            onConflict: ["symbol"],
-          });
-
-          if (error) {
-            console.log(
-              "[SUPABASE ERROR]",
-              typeof error === "object" && error && "message" in error ? String(error.message) : String(error)
-            );
-          } else {
-            console.log(`[SUPABASE] Upserted ${upsertPayload.length} stocks`);
-          }
-        } else {
-          console.log("[SUPABASE] No valid stocks to upsert");
-        }
-      } catch (err) {
-        console.log(
-          "[SUPABASE ERROR]",
-          typeof err === "object" && err && "message" in err ? String(err.message) : String(err)
-        );
+        errorData = JSON.parse(errorText);
+      } catch {
+        errorData = { error: errorText };
       }
-    } else {
-      console.log("[SUPABASE] Missing URL or service role key, skipping DB update");
+      
+      return new Response(
+        JSON.stringify({ 
+          error: "FMP screener failed", 
+          status: fmpRes.status,
+          message: errorData
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } }
+      );
     }
-
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-    console.log(`[COMPLETE] Returned ${paginatedResults.length} results in ${duration}s`);
-
+    
+    const fmpData = await fmpRes.json();
+    console.log(`✓ FMP screener: ${Date.now() - fmpStart}ms`);
+    
+    // Handle error responses
+    if (fmpData && typeof fmpData === 'object' && 'Error Message' in fmpData) {
+      console.error('FMP returned error:', fmpData);
+      return new Response(
+        JSON.stringify({ 
+          error: "FMP API error",
+          message: fmpData['Error Message']
+        }),
+        { status: 502, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    
+    // Extract symbols
+    let candidates: string[] = [];
+    if (Array.isArray(fmpData)) {
+      candidates = fmpData
+        .map((r: any) => r.symbol ?? r.ticker)
+        .filter(Boolean)
+        .slice(0, limit * 3); // Get more candidates for better filtering
+    }
+    
+    if (candidates.length === 0) {
+      console.log('No candidates from FMP');
+      return new Response(
+        JSON.stringify({ 
+          stocks: [],
+          source: "FMP->Yahoo(batch)->FMP(selective)",
+          performance: {
+            total_time_ms: Date.now() - requestStart,
+            api_calls: { fmp: 1, yahoo: 0 },
+            cache_hit_rate: "0%"
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    
+    console.log(`→ ${candidates.length} candidates from FMP`);
+    
+    // Step 2: Enrich with caching and batching
+    const enriched = await enrichSymbols(candidates);
+    
+    // Step 3: Apply post-enrichment filters
+    const filtered = enriched.filter(q => {
+      if (filters.float_max != null && q.shares_float != null && q.shares_float > filters.float_max) return false;
+      if (filters.change_min != null && q.change_percent != null && q.change_percent < filters.change_min) return false;
+      if (filters.change_max != null && q.change_percent != null && q.change_percent > filters.change_max) return false;
+      if (filters.relative_volume_min != null && q.relative_volume != null && q.relative_volume < filters.relative_volume_min) return false;
+      if (filters.price_min != null && q.price != null && q.price < filters.price_min) return false;
+      if (filters.price_max != null && q.price != null && q.price > filters.price_max) return false;
+      if (filters.volume_min != null && q.volume != null && q.volume < filters.volume_min) return false;
+      if (filters.market_cap_max != null && q.market_cap != null && q.market_cap > filters.market_cap_max) return false;
+      return true;
+    });
+    
+    const out = filtered.slice(0, limit);
+    
+    const totalTime = Date.now() - requestStart;
+    const cacheHitRate = candidates.length > 0 
+      ? `${((enriched.length / candidates.length) * 100).toFixed(1)}%`
+      : "0%";
+    
+    console.log(`\n=== Results ===`);
+    console.log(`Total time: ${totalTime}ms`);
+    console.log(`Candidates: ${candidates.length} → Enriched: ${enriched.length} → Filtered: ${filtered.length} → Final: ${out.length}`);
+    
     return new Response(
       JSON.stringify({
-        success: true,
-        count: paginatedResults.length,
-        total_matched: filteredStocks.length,
-        total_checked: validStocks.length,
-        results: paginatedResults
-          .filter((stock) => stock)
-          .map((stock) => ({
-            symbol: stock.symbol,
-            name: stock.name,
-            price: stock.price,
-            change_percent: stock.change_percent,
-            volume: stock.volume,
-            relative_volume: stock.relative_volume,
-            market_cap: stock.market_cap,
-            shares_float: stock.shares_float,
-          })),
-        stats: {
-          symbols_checked: symbolsToCheck.length,
-          symbols_with_data: validStocks.length,
-          symbols_matched: filteredStocks.length,
-          api_calls_used: apiCallTimestamps.length,
-          duration_seconds: parseFloat(duration),
+        source: "FMP->Yahoo(batch)->FMP(selective)",
+        count: out.length,
+        performance: {
+          total_time_ms: totalTime,
+          candidates: candidates.length,
+          enriched: enriched.length,
+          filtered: filtered.length,
+          cache_hit_rate: cacheHitRate,
+          avg_time_per_symbol_ms: (totalTime / candidates.length).toFixed(2)
         },
+        stocks: out
       }),
-      {
-        headers: { "content-type": "application/json" },
-        status: 200,
-      }
+      { status: 200, headers: { "Content-Type": "application/json" } }
     );
+    
   } catch (err) {
-    console.log("[ERROR] Fatal:", String(err?.message ?? err));
+    console.error('Unexpected error:', err);
     return new Response(
-      JSON.stringify({
-        error: String(err?.message ?? err),
-        stack: err?.stack,
+      JSON.stringify({ 
+        error: String(err),
+        stack: err instanceof Error ? err.stack : undefined
       }),
-      {
-        status: 500,
-        headers: { "content-type": "application/json" },
-      }
+      { status: 500, headers: { "Content-Type": "application/json" } }
     );
   }
 });

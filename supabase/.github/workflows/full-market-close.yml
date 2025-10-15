@@ -1,0 +1,35 @@
+# .github/workflows/full-market-close.yml
+# Full update at market close (optional)
+name: Full Stock Update (Market Close)
+
+on:
+  schedule:
+    # Monday-Friday at 4:05 PM ET (20:05 UTC for EST, 21:05 UTC for EDT)
+    # Using 20:05 UTC (EST)
+    - cron: '05 20 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  full-update-close:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Full Market Close Update
+        run: |
+          echo "Starting full market close update..."
+          
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_FUNCTIONS_URL }}/update-stocks?mode=full" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+          
+          echo "Response: $body"
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "Error: HTTP $http_code"
+            exit 1
+          fi

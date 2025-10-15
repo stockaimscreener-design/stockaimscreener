@@ -22,7 +22,7 @@ export async function POST(request: NextRequest) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${authKey}`,
+        'Authorization': `Bearer ${authKey}`,    
       },
       body: JSON.stringify(body),
     })
@@ -31,6 +31,7 @@ export async function POST(request: NextRequest) {
     
     if (!response.ok) {
       const errorText = await response.text()
+      console.log (request.headers)
       console.error('Edge function error response:', errorText)
       throw new Error(`Edge function error: ${response.status}`)
     }

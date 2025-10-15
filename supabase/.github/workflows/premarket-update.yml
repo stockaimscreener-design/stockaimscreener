@@ -1,0 +1,35 @@
+# .github/workflows/premarket-update.yml
+# Premarket update (optional)
+name: Premarket Stock Update
+
+on:
+  schedule:
+    # Monday-Friday at 7:30 AM ET (11:30 UTC for EST, 12:30 UTC for EDT)
+    # Using 11:30 UTC (EST)
+    - cron: '30 11 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  premarket-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Premarket Delta Update
+        run: |
+          echo "Starting premarket update..."
+          
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.SUPABASE_FUNCTIONS_URL }}/update-stocks?mode=delta" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | head -n-1)
+          
+          echo "Response: $body"
+          
+          if [ "$http_code" -ne 200 ]; then
+            echo "Warning: HTTP $http_code"
+            # Don't fail - premarket data might be limited
+          fi
